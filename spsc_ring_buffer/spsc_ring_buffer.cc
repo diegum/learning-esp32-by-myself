@@ -6,24 +6,32 @@
  *
  * Compilation:
  *   export SDKROOT="$(xcrun --show-sdk-path)"   # macOS only
- *   C++17: clang++ -std=c++17 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
- *   C++20: clang++ -std=c++20 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *   C++23: clang++ -std=c++23 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *   C++26: clang++ -std=c++26 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *
  * For GCC, replace clang++ with g++ (same flags)
  */
 
+#if __cplusplus < 202302L
+#error "This example requires C++23 or later"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+enum class PushError { full };
+enum class PopError { empty };
+using PushResult = std::expected<void, PushError>;
+using PopResult = std::expected<int16_t, PopError>;
 
 // ============================================================================
 // PART 1: THE SPSC RING BUFFER
@@ -53,20 +61,42 @@
  * - We use bitmask AND (&) with power-of-2 buffer size (optimization)
  * - The size is rounded up to next power of 2 internally
  */
-class SPSCRingBuffer {
+template <size_t Capacity> class SPSCRingBuffer {
+  // Compile-time validation block
+  // This executes at compile-time for every template instantiation
+  static_assert((Capacity & (Capacity - 1)) == 0,
+                "Capacity MUST be a power of 2 (e.g., 64, 128, 256)");
+  static_assert(
+      Capacity > 1,
+      "Capacity must be at least 2 (one slot needed for full/empty detection)");
+  static_assert(
+      Capacity <= 4096,
+      "Capacity > 4096 wastes memory on ESP32 (typical RAM is 520KB)");
+  static_assert(std::is_same<int16_t, int16_t>::value,
+                "Sample type must be int16_t for audio processing");
+  // std::atomic_ref requires C++20. The referenced storage is aligned below.
+  static_assert(std::atomic_ref<size_t>::is_always_lock_free,
+                "Atomic operations must be lock-free for ISR safety");
+
+  // Ensure our bitmask optimization works
+  static constexpr size_t MASK = Capacity - 1;
+  static_assert((Capacity & MASK) == 0, "Mask calculation is incorrect");
+
 public:
   /**
-   * Constructor - Allocates the buffer
-   * @param capacity Maximum number of elements (will be rounded to power of 2)
+   * Constructor - No dynamic allocation in the hot path
+   * All memory is statically allocated
    */
-  explicit SPSCRingBuffer(size_t capacity)
-      : m_capacity(roundUpToPowerOfTwo(capacity)), m_mask(m_capacity - 1),
-        m_buffer(m_capacity), m_head(0), m_tail(0) {
-    // Verify power-of-2 for efficient masking
-    // This check is optimized out in release builds if capacity is constexpr
-    if ((m_capacity & (m_capacity - 1)) != 0) {
-      throw std::invalid_argument("Capacity must be power of 2");
+  SPSCRingBuffer()
+      : m_head(0), m_tail(0), m_head_ref(m_head), m_tail_ref(m_tail) {
+// Runtime check is still useful for debug builds
+// but the static_assert already caught most issues
+#ifndef NDEBUG
+    if ((Capacity & (Capacity - 1)) != 0) {
+      // This should never happen due to static_assert
+      std::terminate();
     }
+#endif
   }
 
   // Disable copy/move (ring buffers should not be copied)
@@ -92,19 +122,19 @@ public:
    * @param sample The audio sample to push
    * @return true if pushed successfully, false if buffer was full
    */
-  [[nodiscard]] bool push(int16_t sample) noexcept {
+  [[nodiscard]] PushResult push(int16_t sample) noexcept {
     // Load current head and tail atomically
     // We need the current head to check if buffer is full
-    const size_t head = m_head.load(std::memory_order_relaxed);
-    const size_t tail = m_tail.load(std::memory_order_acquire);
+    const size_t head = m_head_ref.load(std::memory_order_relaxed);
+    const size_t tail = m_tail_ref.load(std::memory_order_acquire);
 
     // Calculate next head position using bitmask (faster than modulo)
-    const size_t next_head = (head + 1) & m_mask;
+    const size_t next_head = (head + 1) & MASK;
 
     // Check if buffer is full
     // Full condition: (head + 1) == tail (when using power-of-2 size)
     if (next_head == tail) {
-      return false; // Buffer full - drop sample
+      return std::unexpected(PushError::full);
     }
 
     // Write the sample to the buffer
@@ -112,12 +142,12 @@ public:
     // this position until we update head (thanks to memory ordering)
     m_buffer[head] = sample;
 
-    // Release barrier: Ensure sample write is complete before updating head
-    // This prevents the compiler/CPU from reordering the write after the head
-    // update
-    m_head.store(next_head, std::memory_order_release);
+    // Write the sample to the buffer
+    // Note: We don't need atomic here because the consumer won't read
+    // this position until we update head (thanks to memory ordering)
+    m_head_ref.store(next_head, std::memory_order_release);
 
-    return true;
+    return {};
   }
 
   /**
@@ -131,39 +161,27 @@ public:
    * @param out Reference to store the popped sample
    * @return true if sample popped successfully, false if buffer was empty
    */
-  [[nodiscard]] bool pop(int16_t &out) noexcept {
+  [[nodiscard]] PopResult pop() noexcept {
     // Load current tail and head
-    const size_t tail = m_tail.load(std::memory_order_relaxed);
-    const size_t head = m_head.load(std::memory_order_acquire);
+    const size_t tail = m_tail_ref.load(std::memory_order_relaxed);
+    const size_t head = m_head_ref.load(std::memory_order_acquire);
 
     // Check if buffer is empty
     if (tail == head) {
-      return false; // Buffer empty
+      return std::unexpected(PopError::empty);
     }
 
     // Read the sample from the buffer
-    out = m_buffer[tail];
+    const int16_t out = m_buffer[tail];
 
     // Calculate next tail position
-    const size_t next_tail = (tail + 1) & m_mask;
+    const size_t next_tail = (tail + 1) & MASK;
 
     // Release barrier: Ensure sample read is complete before updating tail
     // This pairs with the acquire in push() to prevent reading stale data
-    m_tail.store(next_tail, std::memory_order_release);
+    m_tail_ref.store(next_tail, std::memory_order_release);
 
-    return true;
-  }
-
-  /**
-   * is_empty - Non-blocking check
-   *
-   * Note: In a real system, this might be used with caution
-   * because the state can change between check and use
-   */
-  [[nodiscard]] bool is_empty() const noexcept {
-    const size_t head = m_head.load(std::memory_order_acquire);
-    const size_t tail = m_tail.load(std::memory_order_acquire);
-    return tail == head;
+    return out;
   }
 
   /**
@@ -173,38 +191,30 @@ public:
    * Used for debugging/logging only
    */
   [[nodiscard]] size_t size() const noexcept {
-    const size_t head = m_head.load(std::memory_order_acquire);
-    const size_t tail = m_tail.load(std::memory_order_acquire);
-    return (head - tail) & m_mask;
+    const size_t head = m_head_ref.load(std::memory_order_acquire);
+    const size_t tail = m_tail_ref.load(std::memory_order_acquire);
+    return (head - tail) & MASK;
   }
 
   /**
    * capacity - Returns the actual buffer capacity
    */
-  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
+  [[nodiscard]] size_t capacity() const noexcept { return Capacity; }
 
 private:
-  /**
-   * Round up to next power of 2 for efficient masking
-   * This is a common embedded systems optimization
-   */
-  static constexpr size_t roundUpToPowerOfTwo(size_t n) {
-    size_t power = 1;
-    while (power < n) {
-      power <<= 1;
-    }
-    return power;
-  }
-
-  const size_t m_capacity; // Power-of-2 buffer size
-  const size_t m_mask;     // Bitmask for fast modulo operations (capacity-1)
-  std::vector<int16_t> m_buffer; // The actual buffer storage
+  // Static buffer - no heap allocation at all!
+  // This is more suitable for ESP32 than std::vector
+  int16_t m_buffer[Capacity];
 
   // Atomic head and tail indices
   // head: Points to the next position to write (producer)
   // tail: Points to the next position to read (consumer)
-  std::atomic<size_t> m_head;
-  std::atomic<size_t> m_tail;
+  // atomic_ref requires suitably aligned, non-atomic storage with a stable
+  // lifetime. These fields remain in place for the lifetime of the buffer.
+  alignas(std::atomic_ref<size_t>::required_alignment) mutable size_t m_head;
+  alignas(std::atomic_ref<size_t>::required_alignment) mutable size_t m_tail;
+  std::atomic_ref<size_t> m_head_ref;
+  std::atomic_ref<size_t> m_tail_ref;
 };
 
 // ============================================================================
@@ -212,10 +222,12 @@ private:
 // ============================================================================
 
 // Global flag for graceful shutdown
-static volatile bool g_running = true;
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "The shutdown flag must be lock-free for signal-handler use");
+static std::atomic<bool> g_running{true};
 
 // Signal handler for Ctrl+C
-void signal_handler(int) { g_running = false; }
+void signal_handler(int) { g_running.store(false, std::memory_order_relaxed); }
 
 // ============================================================================
 // PART 3: MAIN APPLICATION WITH KEYBOARD CONTROL
@@ -231,32 +243,38 @@ void signal_handler(int) { g_running = false; }
  * @param freq_ptr Pointer to the frequency atomic variable (samples/sec)
  * @param sample_counter Pointer to counter for logging purposes
  */
-void isr_producer(SPSCRingBuffer &buffer, std::atomic<int> &freq_ptr,
+template <size_t Capacity>
+void isr_producer(SPSCRingBuffer<Capacity> &buffer, std::atomic<int> &freq_ptr,
                   std::atomic<uint64_t> &sample_counter) {
   int16_t sample_value = 0;
 
-  while (g_running) {
+  while (g_running.load(std::memory_order_relaxed)) {
     // Calculate sleep time based on current frequency
     int freq = freq_ptr.load(std::memory_order_acquire);
+    if (freq <= 0) {
+      g_running.store(false, std::memory_order_relaxed);
+      break;
+    }
     int sleep_ms = 1000 / freq; // Convert from samples/sec to ms/sample
 
-    // Wait for the next sample interval
+    // Simulation only: a real ESP32 ISR must never sleep or block.
     std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 
-    if (!g_running)
+    if (!g_running.load(std::memory_order_relaxed))
       break;
 
     // Generate a sample (simple sawtooth wave for demo)
     sample_value = (sample_value + 1) % 32767;
 
     // Try to push to buffer
-    bool success = buffer.push(sample_value);
+    const PushResult result = buffer.push(sample_value);
 
-    // Increment counter for logging
+    // Simulation only: a 64-bit atomic increment is not guaranteed to be
+    // lock-free on ESP32 and must not be used from a real ISR.
     uint64_t count = sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    // Log the result
-    if (success) {
+    // Simulation only: console I/O is not allowed from a real ESP32 ISR.
+    if (result) {
       std::cout << "[ISR] Generated sample #" << count
                 << " (value: " << sample_value << ")" << std::endl;
     } else {
@@ -275,25 +293,31 @@ void isr_producer(SPSCRingBuffer &buffer, std::atomic<int> &freq_ptr,
  * @param freq_ptr Pointer to the frequency atomic variable (samples/sec)
  * @param sample_counter Pointer to counter for logging purposes
  */
-void consumer(SPSCRingBuffer &buffer, std::atomic<int> &freq_ptr,
+template <size_t Capacity>
+void consumer(SPSCRingBuffer<Capacity> &buffer, std::atomic<int> &freq_ptr,
               std::atomic<uint64_t> &sample_counter) {
   int16_t sample = 0;
 
-  while (g_running) {
+  while (g_running.load(std::memory_order_relaxed)) {
     // Calculate sleep time based on current frequency
     int freq = freq_ptr.load(std::memory_order_acquire);
+    if (freq <= 0) {
+      g_running.store(false, std::memory_order_relaxed);
+      break;
+    }
     int sleep_ms = 1000 / freq;
 
     // Wait for the next consumption interval
     std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
 
-    if (!g_running)
+    if (!g_running.load(std::memory_order_relaxed))
       break;
 
     // Try to pop from buffer
-    bool success = buffer.pop(sample);
+    const PopResult result = buffer.pop();
 
-    if (success) {
+    if (result) {
+      sample = *result;
       // Increment counter
       uint64_t count =
           sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -331,7 +355,7 @@ void keyboard_handler(std::atomic<int> &isr_freq,
   std::cout << "======================================\n" << std::endl;
 
   char input;
-  while (g_running && std::cin >> input) {
+  while (g_running.load(std::memory_order_relaxed) && std::cin >> input) {
     int current = isr_freq.load(std::memory_order_acquire);
     int new_freq = current;
 
@@ -348,7 +372,7 @@ void keyboard_handler(std::atomic<int> &isr_freq,
 
     case 'q': // Quit
     case 'Q':
-      g_running = false;
+      g_running.store(false, std::memory_order_relaxed);
       return;
 
     default:
@@ -363,6 +387,9 @@ void keyboard_handler(std::atomic<int> &isr_freq,
                 << " samples/sec" << std::endl;
     }
   }
+
+  // EOF or an input error must also stop the worker threads before joining.
+  g_running.store(false, std::memory_order_relaxed);
 }
 
 /**
@@ -381,11 +408,18 @@ int main() {
 
   // Configuration
   constexpr size_t BUFFER_SIZE = 64;
+  // Usage - The compile-time checks trigger here
+  // This will compile fine
+  using AudioBuffer = SPSCRingBuffer<BUFFER_SIZE>;
+  // This would FAIL to compile (power of 2 check)
+  // using InvalidBuffer = SPSCRingBuffer<63>;  // static_assert fails!
+  // This would FAIL to compile (too small)
+  // using TooSmallBuffer = SPSCRingBuffer<1>;  // static_assert fails!
   constexpr int INITIAL_ISR_FREQ = 1;      // 1 sample/sec
   constexpr int INITIAL_CONSUMER_FREQ = 5; // 5 samples/sec
 
   // Create the ring buffer
-  SPSCRingBuffer buffer(BUFFER_SIZE);
+  AudioBuffer buffer;
   std::cout << "[MAIN] Created ring buffer with capacity: " << buffer.capacity()
             << " elements" << std::endl;
 
@@ -398,11 +432,11 @@ int main() {
   std::atomic<uint64_t> consumer_sample_count(0);
 
   // Launch the producer (ISR simulation) thread
-  std::thread producer_thread(isr_producer, std::ref(buffer),
+  std::thread producer_thread(isr_producer<BUFFER_SIZE>, std::ref(buffer),
                               std::ref(isr_freq), std::ref(isr_sample_count));
 
   // Launch the consumer thread
-  std::thread consumer_thread(consumer, std::ref(buffer),
+  std::thread consumer_thread(consumer<BUFFER_SIZE>, std::ref(buffer),
                               std::ref(consumer_freq),
                               std::ref(consumer_sample_count));
 
