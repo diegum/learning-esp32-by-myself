@@ -6,24 +6,32 @@
  *
  * Compilation:
  *   export SDKROOT="$(xcrun --show-sdk-path)"   # macOS only
- *   C++17: clang++ -std=c++17 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
- *   C++20: clang++ -std=c++20 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *   C++23: clang++ -std=c++23 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *   C++26: clang++ -std=c++26 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
  *
  * For GCC, replace clang++ with g++ (same flags)
  */
 
+#if __cplusplus < 202302L
+#error "This example requires C++23 or later"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+enum class PushError { full };
+enum class PopError { empty };
+using PushResult = std::expected<void, PushError>;
+using PopResult = std::expected<int16_t, PopError>;
 
 // ============================================================================
 // PART 1: THE SPSC RING BUFFER
@@ -66,7 +74,8 @@ template <size_t Capacity> class SPSCRingBuffer {
       "Capacity > 4096 wastes memory on ESP32 (typical RAM is 520KB)");
   static_assert(std::is_same<int16_t, int16_t>::value,
                 "Sample type must be int16_t for audio processing");
-  static_assert(std::atomic<size_t>::is_always_lock_free,
+  // std::atomic_ref requires C++20. The referenced storage is aligned below.
+  static_assert(std::atomic_ref<size_t>::is_always_lock_free,
                 "Atomic operations must be lock-free for ISR safety");
 
   // Ensure our bitmask optimization works
@@ -78,7 +87,8 @@ public:
    * Constructor - No dynamic allocation in the hot path
    * All memory is statically allocated
    */
-  SPSCRingBuffer() : m_head(0), m_tail(0) {
+  SPSCRingBuffer()
+      : m_head(0), m_tail(0), m_head_ref(m_head), m_tail_ref(m_tail) {
 // Runtime check is still useful for debug builds
 // but the static_assert already caught most issues
 #ifndef NDEBUG
@@ -112,11 +122,11 @@ public:
    * @param sample The audio sample to push
    * @return true if pushed successfully, false if buffer was full
    */
-  [[nodiscard]] bool push(int16_t sample) noexcept {
+  [[nodiscard]] PushResult push(int16_t sample) noexcept {
     // Load current head and tail atomically
     // We need the current head to check if buffer is full
-    const size_t head = m_head.load(std::memory_order_relaxed);
-    const size_t tail = m_tail.load(std::memory_order_acquire);
+    const size_t head = m_head_ref.load(std::memory_order_relaxed);
+    const size_t tail = m_tail_ref.load(std::memory_order_acquire);
 
     // Calculate next head position using bitmask (faster than modulo)
     const size_t next_head = (head + 1) & MASK;
@@ -124,7 +134,7 @@ public:
     // Check if buffer is full
     // Full condition: (head + 1) == tail (when using power-of-2 size)
     if (next_head == tail) {
-      return false; // Buffer full
+      return std::unexpected(PushError::full);
     }
 
     // Write the sample to the buffer
@@ -135,9 +145,9 @@ public:
     // Write the sample to the buffer
     // Note: We don't need atomic here because the consumer won't read
     // this position until we update head (thanks to memory ordering)
-    m_head.store(next_head, std::memory_order_release);
+    m_head_ref.store(next_head, std::memory_order_release);
 
-    return true;
+    return {};
   }
 
   /**
@@ -151,27 +161,27 @@ public:
    * @param out Reference to store the popped sample
    * @return true if sample popped successfully, false if buffer was empty
    */
-  [[nodiscard]] bool pop(int16_t &out) noexcept {
+  [[nodiscard]] PopResult pop() noexcept {
     // Load current tail and head
-    const size_t tail = m_tail.load(std::memory_order_relaxed);
-    const size_t head = m_head.load(std::memory_order_acquire);
+    const size_t tail = m_tail_ref.load(std::memory_order_relaxed);
+    const size_t head = m_head_ref.load(std::memory_order_acquire);
 
     // Check if buffer is empty
     if (tail == head) {
-      return false; // Buffer empty
+      return std::unexpected(PopError::empty);
     }
 
     // Read the sample from the buffer
-    out = m_buffer[tail];
+    const int16_t out = m_buffer[tail];
 
     // Calculate next tail position
     const size_t next_tail = (tail + 1) & MASK;
 
     // Release barrier: Ensure sample read is complete before updating tail
     // This pairs with the acquire in push() to prevent reading stale data
-    m_tail.store(next_tail, std::memory_order_release);
+    m_tail_ref.store(next_tail, std::memory_order_release);
 
-    return true;
+    return out;
   }
 
   /**
@@ -181,8 +191,8 @@ public:
    * Used for debugging/logging only
    */
   [[nodiscard]] size_t size() const noexcept {
-    const size_t head = m_head.load(std::memory_order_acquire);
-    const size_t tail = m_tail.load(std::memory_order_acquire);
+    const size_t head = m_head_ref.load(std::memory_order_acquire);
+    const size_t tail = m_tail_ref.load(std::memory_order_acquire);
     return (head - tail) & MASK;
   }
 
@@ -199,8 +209,12 @@ private:
   // Atomic head and tail indices
   // head: Points to the next position to write (producer)
   // tail: Points to the next position to read (consumer)
-  std::atomic<size_t> m_head;
-  std::atomic<size_t> m_tail;
+  // atomic_ref requires suitably aligned, non-atomic storage with a stable
+  // lifetime. These fields remain in place for the lifetime of the buffer.
+  alignas(std::atomic_ref<size_t>::required_alignment) mutable size_t m_head;
+  alignas(std::atomic_ref<size_t>::required_alignment) mutable size_t m_tail;
+  std::atomic_ref<size_t> m_head_ref;
+  std::atomic_ref<size_t> m_tail_ref;
 };
 
 // ============================================================================
@@ -253,14 +267,14 @@ void isr_producer(SPSCRingBuffer<Capacity> &buffer, std::atomic<int> &freq_ptr,
     sample_value = (sample_value + 1) % 32767;
 
     // Try to push to buffer
-    bool success = buffer.push(sample_value);
+    const PushResult result = buffer.push(sample_value);
 
     // Simulation only: a 64-bit atomic increment is not guaranteed to be
     // lock-free on ESP32 and must not be used from a real ISR.
     uint64_t count = sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 
     // Simulation only: console I/O is not allowed from a real ESP32 ISR.
-    if (success) {
+    if (result) {
       std::cout << "[ISR] Generated sample #" << count
                 << " (value: " << sample_value << ")" << std::endl;
     } else {
@@ -300,9 +314,10 @@ void consumer(SPSCRingBuffer<Capacity> &buffer, std::atomic<int> &freq_ptr,
       break;
 
     // Try to pop from buffer
-    bool success = buffer.pop(sample);
+    const PopResult result = buffer.pop();
 
-    if (success) {
+    if (result) {
+      sample = *result;
       // Increment counter
       uint64_t count =
           sample_counter.fetch_add(1, std::memory_order_relaxed) + 1;

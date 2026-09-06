@@ -4,7 +4,8 @@ A C++ demonstration of a lock-free single-producer/single-consumer (SPSC) ring b
 
 ## Features
 
-- Lock-free producer and consumer operations using `std::atomic`
+- Lock-free producer and consumer operations using `std::atomic_ref`
+- Explicit full/empty errors using `std::expected`
 - Acquire/release memory ordering between producer and consumer
 - Fixed-size storage allocated during construction
 - Power-of-two capacity for efficient index wrapping
@@ -13,7 +14,7 @@ A C++ demonstration of a lock-free single-producer/single-consumer (SPSC) ring b
 
 ## Requirements
 
-- C++17 or newer
+- C++23 or newer
 - Clang or GCC
 - POSIX threads support
 
@@ -25,21 +26,21 @@ On macOS, Apple Clang requires the Xcode Command Line Tools or Xcode. The non-sy
 
 ```sh
 export SDKROOT="$(xcrun --show-sdk-path)"
-clang++ -std=c++26 -O2 -pthread spsc_ring_buffer.cpp -o spsc_ring_buffer
+clang++ -std=c++23 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
 ```
 
 Alternatively, use Apple Clang directly:
 
 ```sh
-/usr/bin/clang++ -std=c++26 -O2 -pthread spsc_ring_buffer.cpp -o spsc_ring_buffer
+/usr/bin/clang++ -std=c++23 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
 ```
 
-Any supported language mode can be used by replacing `c++26` with `c++17`, `c++20`, or `c++23`.
+Use C++23 or a later standard mode.
 
 ### GCC
 
 ```sh
-g++ -std=c++20 -O2 -pthread spsc_ring_buffer.cpp -o spsc_ring_buffer
+g++ -std=c++23 -O2 -pthread spsc_ring_buffer.cc -o spsc_ring_buffer
 ```
 
 ## Run
@@ -63,9 +64,8 @@ The output reports generated samples, consumed samples, buffer-full events, and 
 
 `SPSCRingBuffer` exposes:
 
-- `push(int16_t sample)`: add a sample; returns `false` when full
-- `pop(int16_t& out)`: remove a sample; returns `false` when empty
-- `is_empty()`: check whether the buffer is empty
+- `push(int16_t sample)`: add a sample; returns `std::unexpected(PushError::full)` when full
+- `pop()`: returns the sample or `std::unexpected(PopError::empty)` when empty
 - `size()`: return the current approximate number of stored elements
 - `capacity()`: return the allocated power-of-two capacity
 
@@ -75,6 +75,9 @@ The requested capacity is rounded up to the next power of two. Because the imple
 
 The buffer assumes exactly one producer and one consumer. It is not safe for multiple producers or multiple consumers without additional synchronization.
 
-The producer publishes a written sample by storing the new head index with release ordering. The consumer loads that index with acquire ordering before reading the sample. The same pattern is used for the tail index so the producer can safely reuse consumed slots.
+The producer publishes a written sample by storing the new head index through
+`std::atomic_ref` with release ordering. The consumer loads that index with
+acquire ordering before reading the sample. The same pattern is used for the
+tail index so the producer can safely reuse consumed slots.
 
 The demo's producer thread represents an ISR for educational purposes. The thread uses sleeping and console output, neither of which is appropriate inside a real hardware ISR.
