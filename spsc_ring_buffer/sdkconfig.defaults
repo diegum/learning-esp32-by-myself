@@ -1,0 +1,20 @@
+# Console on UART0 so QEMU and `idf.py monitor` can talk to it.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Use the FreeRTOS tick at 1000 Hz → 1 ms resolution for pdMS_TO_TICKS().
+CONFIG_FREERTOS_HZ=1000
+
+# 2 cores (ESP32) — pin audio tasks to core 1, away from Wi-Fi.
+CONFIG_FREERTOS_UNICORE=n
+
+# Optional: enable the task watchdog in production. Disabled here so it
+# doesn't interfere with the demo's deliberate deliberate pacing.
+CONFIG_ESP_TASK_WDT_INIT=n
+
+# Enable C++ exceptions only if you need them; we don't.
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+
+# Log verbosity so the demo isn't drowned in boot noise.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
